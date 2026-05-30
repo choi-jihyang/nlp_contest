@@ -1,6 +1,7 @@
 # =========================
 # 1. 라이브러리 불러오기
 # =========================
+import time
 import pandas as pd
 import torch
 
@@ -19,192 +20,153 @@ from sklearn.metrics import accuracy_score
 # =========================
 # 2. NSMC 데이터셋 불러오기
 # =========================
-train = pd.read_csv(
-    "ratings_train.txt",
-    sep="\t"
-)
+train = pd.read_csv("ratings_train.txt", sep="\t")
+test = pd.read_csv("ratings_test.txt", sep="\t")
 
-test = pd.read_csv(
-    "ratings_test.txt",
-    sep="\t"
-)
-
-# 결측치 제거
 train = train.dropna()
 test = test.dropna()
 
-print(train.head())
-
-
-# =========================
-# 3. 필요한 컬럼만 사용
-# =========================
 train = train[["document", "label"]]
 test = test[["document", "label"]]
 
-
-# =========================
-# 4. HuggingFace Dataset 변환
-# =========================
 train_dataset = Dataset.from_pandas(train)
 test_dataset = Dataset.from_pandas(test)
 
 
 # =========================
-# 5. KoELECTRA 토크나이저 불러오기
+# 3. 비교할 모델 목록
 # =========================
-MODEL_NAME = "monologg/koelectra-base-v3-discriminator"
+MODELS = [
+    "monologg/koelectra-base-v3-discriminator",
+    "answerdotai/ModernBERT-base",
+    "klue/roberta-base",
+    "snunlp/KR-ELECTRA-discriminator",
+]
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-
-# =========================
-# 6. 토크나이징 함수
-# =========================
-def tokenize_function(examples):
-    return tokenizer(
-        examples["document"],
-        padding="max_length",
-        truncation=True,
-        max_length=128
-    )
+SAMPLE_TEXT = "진짜 재미있고 감동적인 영화였다"
+TRAIN_SAMPLES = 500
+EVAL_SAMPLES  = 100
 
 
 # =========================
-# 7. 데이터 토크나이징
-# =========================
-tokenized_train = train_dataset.map(
-    tokenize_function,
-    batched=True
-)
-
-tokenized_test = test_dataset.map(
-    tokenize_function,
-    batched=True
-)
-
-
-# =========================
-# 8. PyTorch 형식 변환
-# =========================
-tokenized_train.set_format(
-    type="torch",
-    columns=[
-        "input_ids",
-        "attention_mask",
-        "label"
-    ]
-)
-
-tokenized_test.set_format(
-    type="torch",
-    columns=[
-        "input_ids",
-        "attention_mask",
-        "label"
-    ]
-)
-
-
-# =========================
-# 9. 모델 불러오기
-# =========================
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_NAME,
-    num_labels=2
-)
-
-
-# =========================
-# 10. 평가 함수
+# 4. 평가 함수
 # =========================
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
+    predictions = torch.argmax(torch.tensor(logits), dim=-1)
+    return {"accuracy": accuracy_score(labels, predictions)}
 
-    predictions = torch.argmax(
-        torch.tensor(logits),
-        dim=-1
+
+# =========================
+# 5. 모델별 실행 및 시간 측정
+# =========================
+results = []
+
+for model_name in MODELS:
+    print(f"\n{'='*60}")
+    print(f"모델: {model_name}")
+    print(f"{'='*60}")
+    timing = {"model": model_name}
+
+    # --- 토크나이저 & 모델 로딩 ---
+    t0 = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=2
+    )
+    timing["load_sec"] = round(time.time() - t0, 2)
+    print(f"[로딩]    {timing['load_sec']}s")
+
+    # --- 토크나이징 ---
+    def tokenize_function(examples):
+        return tokenizer(
+            examples["document"],
+            padding="max_length",
+            truncation=True,
+            max_length=128
+        )
+
+    t0 = time.time()
+    tokenized_train = train_dataset.map(tokenize_function, batched=True)
+    tokenized_test  = test_dataset.map(tokenize_function,  batched=True)
+    timing["tokenize_sec"] = round(time.time() - t0, 2)
+    print(f"[토크나이징] {timing['tokenize_sec']}s")
+
+    for ds in (tokenized_train, tokenized_test):
+        ds.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "label"]
+        )
+
+    # --- 학습 ---
+    training_args = TrainingArguments(
+        output_dir=f"./results/{model_name.replace('/', '_')}",
+        num_train_epochs=1,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        logging_steps=100,
+        report_to="none"
     )
 
-    acc = accuracy_score(
-        labels,
-        predictions
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train.select(range(TRAIN_SAMPLES)),
+        eval_dataset=tokenized_test.select(range(EVAL_SAMPLES)),
+        compute_metrics=compute_metrics
     )
 
-    return {"accuracy": acc}
+    t0 = time.time()
+    trainer.train()
+    timing["train_sec"] = round(time.time() - t0, 2)
+    print(f"[학습]    {timing['train_sec']}s")
+
+    # --- 평가 ---
+    t0 = time.time()
+    eval_result = trainer.evaluate()
+    timing["eval_sec"] = round(time.time() - t0, 2)
+    timing["accuracy"] = round(eval_result.get("eval_accuracy", 0), 4)
+    print(f"[평가]    {timing['eval_sec']}s  |  accuracy: {timing['accuracy']}")
+
+    # --- 단일 추론 ---
+    inputs = tokenizer(
+        SAMPLE_TEXT,
+        return_tensors="pt",
+        truncation=True,
+        padding=True,
+        max_length=128
+    )
+
+    t0 = time.time()
+    with torch.no_grad():
+        outputs = model(**inputs)
+    timing["inference_sec"] = round(time.time() - t0, 4)
+
+    prediction = torch.argmax(outputs.logits, dim=-1).item()
+    timing["prediction"] = "긍정" if prediction == 1 else "부정"
+    print(f"[추론]    {timing['inference_sec']}s  |  결과: {timing['prediction']}")
+
+    timing["total_sec"] = round(
+        timing["load_sec"] + timing["tokenize_sec"] +
+        timing["train_sec"] + timing["eval_sec"],
+        2
+    )
+    results.append(timing)
+
+    # 메모리 해제
+    del model, tokenizer, trainer
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 
 # =========================
-# 11. 학습 설정
+# 6. 결과 비교표 출력
 # =========================
-training_args = TrainingArguments(
-    output_dir="./results",
+print(f"\n{'='*60}")
+print("모델 실행시간 비교")
+print(f"{'='*60}")
 
-    # 학습 횟수
-    num_train_epochs=1,
-
-    # 배치 크기
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-
-    # 로그 출력
-    logging_steps=100,
-
-    report_to="none"
-)
-
-
-# =========================
-# 12. Trainer 생성
-# =========================
-trainer = Trainer(
-    model=model,
-    args=training_args,
-
-    # 데이터 일부만 사용 (속도 개선)
-    train_dataset=tokenized_train.select(range(500)),
-    eval_dataset=tokenized_test.select(range(100)),
-
-    compute_metrics=compute_metrics
-)
-
-
-# =========================
-# 13. 모델 학습
-# =========================
-trainer.train()
-
-
-# =========================
-# 14. 모델 평가
-# =========================
-result = trainer.evaluate()
-
-print(result)
-
-
-# =========================
-# 15. 직접 예측
-# =========================
-text = "진짜 재미있고 감동적인 영화였다"
-
-inputs = tokenizer(
-    text,
-    return_tensors="pt",
-    truncation=True,
-    padding=True,
-    max_length=128
-)
-
-with torch.no_grad():
-    outputs = model(**inputs)
-
-prediction = torch.argmax(
-    outputs.logits,
-    dim=-1
-).item()
-
-if prediction == 1:
-    print("긍정 리뷰 😊")
-else:
-    print("부정 리뷰 😢")
+df = pd.DataFrame(results).set_index("model")
+df.index.name = "모델"
+df.columns = ["로딩(s)", "토크나이징(s)", "학습(s)", "평가(s)",
+              "정확도", "추론(s)", "예측", "합계(s)"]
+print(df.to_string())
