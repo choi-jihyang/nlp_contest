@@ -2,3 +2,4 @@
 측정 값 : 로딩 속도, 토크나이징 속도, 학습 속도, 정확도
 대상 모델 : KoELECTRA, ModernBERT-base, KLUE RoBERTa-base, KR-ELECTRA
 
+<img width="1201" height="463" alt="image" src="https://github.com/user-attachments/assets/701e9211-dc19-462d-a6dc-41f4d544faec" />
